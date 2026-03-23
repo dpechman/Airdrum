@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_wifi.h>
+#include <esp_mac.h>
 #include <driver/i2s.h>
 #include <math.h>
 
@@ -9,11 +11,11 @@
 // =========================
 #define ESPNOW_CHANNEL          1
 
-// I2S -> PCM5102
+// I2S -> PCM5102 (pinos livres na Adafruit Matrix Portal S3)
 #define I2S_PORT                I2S_NUM_0
-#define I2S_BCLK_PIN            26
-#define I2S_LRCLK_PIN           25
-#define I2S_DOUT_PIN            22
+#define I2S_BCLK_PIN            9
+#define I2S_LRCLK_PIN           10
+#define I2S_DOUT_PIN            11
 
 #define SAMPLE_RATE             22050
 #define AUDIO_BLOCK_SAMPLES     256
@@ -130,6 +132,10 @@ bool dequeueHit(PendingHit &h) {
 // ÁUDIO
 // =========================
 void initI2S() {
+  // PCM5102 SCK ligado no A1 (GPIO3) — configurado como LOW (sckless mode)
+  pinMode(3, OUTPUT);
+  digitalWrite(3, LOW);
+
   i2s_config_t i2s_config = {};
   i2s_config.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
   i2s_config.sample_rate = SAMPLE_RATE;
@@ -390,6 +396,48 @@ void audioTask(void *parameter) {
 }
 
 // =========================
+// SENSORES DE PROXIMIDADE
+// =========================
+struct ProxSensor {
+  uint8_t  pin;
+  uint8_t  zone;
+  bool     lastState;
+  uint32_t lastTrigMs;
+};
+
+static ProxSensor proxSensors[] = {
+  { 21, ZONE_FX,    false, 0 },  // Kick
+  { 47, ZONE_SNARE, false, 0 },  // Snare
+  { 35, ZONE_HHC,   false, 0 },  // HH Fechado
+  { 36, ZONE_HHO,   false, 0 },  // HH Aberto
+  { 39, ZONE_TOM1,  false, 0 },  // Tom 1
+  { 41, ZONE_TOM2,  false, 0 },  // Tom 2
+  {  8, ZONE_SNARE, false, 0 },  // Snare — GPIO 8
+  { 18, ZONE_HHC,   false, 0 },  // HHC   — GPIO 18
+};
+constexpr int NUM_PROX = sizeof(proxSensors) / sizeof(proxSensors[0]);
+
+void initProxSensors() {
+  for (int i = 0; i < NUM_PROX; i++) {
+    pinMode(proxSensors[i].pin, INPUT_PULLDOWN);
+  }
+}
+
+void pollProxSensors() {
+  uint32_t now = millis();
+  for (int i = 0; i < NUM_PROX; i++) {
+    ProxSensor &s = proxSensors[i];
+    bool state = digitalRead(s.pin);
+    // borda de subida + debounce 30ms
+    if (state && !s.lastState && (now - s.lastTrigMs) > 30) {
+      enqueueHit(s.zone, 100, 0xFF);
+      s.lastTrigMs = now;
+    }
+    s.lastState = state;
+  }
+}
+
+// =========================
 // ESPNOW RX
 // =========================
 void onDataRecv(const esp_now_recv_info_t *recvInfo, const uint8_t *incomingData, int len) {
@@ -399,16 +447,11 @@ void onDataRecv(const esp_now_recv_info_t *recvInfo, const uint8_t *incomingData
 
   HitPacket pkt;
   memcpy(&pkt, incomingData, sizeof(pkt));
-  enqueueHit(pkt.zone, pkt.velocity, pkt.stickId);
-
-  Serial.printf("RX stick=%u zone=%u vel=%u peak=%umG dt=%ums from %02X:%02X:%02X:%02X:%02X:%02X\n",
-                pkt.stickId,
-                pkt.zone,
-                pkt.velocity,
-                pkt.peakMilliG,
-                pkt.dtMs,
-                recvInfo->src_addr[0], recvInfo->src_addr[1], recvInfo->src_addr[2],
-                recvInfo->src_addr[3], recvInfo->src_addr[4], recvInfo->src_addr[5]);
+  bool queued = enqueueHit(pkt.zone, pkt.velocity, pkt.stickId);
+  // loga RX e indica se a fila estava cheia
+  Serial.printf("RX z=%u v=%u p=%u dt=%u %s\n",
+                pkt.zone, pkt.velocity, pkt.peakMilliG, pkt.dtMs,
+                queued ? "Q" : "QFULL");
 }
 
 bool initEspNow() {
@@ -427,31 +470,22 @@ bool initEspNow() {
   return true;
 }
 
-void printLocalMac() {
-  uint8_t mac[6];
-  esp_read_mac(mac, ESP_MAC_WIFI_STA);
-  Serial.printf("Central MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
-                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-}
+
 
 // =========================
 // SETUP / LOOP
 // =========================
 void setup() {
   Serial.begin(115200);
-  delay(300);
-
-  Serial.println();
-  Serial.println("=== AIR DRUM CENTRAL ESP32 + PCM5102 ===");
-
-  printLocalMac();
+  delay(200);
 
   if (!initEspNow()) {
-    Serial.println("ERRO: falha no ESP-NOW");
+    Serial.println("ESPNOW FAIL");
     while (true) delay(1000);
   }
 
   initI2S();
+  initProxSensors();
 
   for (int i = 0; i < MAX_VOICES; i++) {
     voices[i].active = false;
@@ -467,18 +501,16 @@ void setup() {
     1
   );
 
-  // som de boot
-  enqueueHit(ZONE_SNARE, 90, 0);
-  enqueueHit(ZONE_HHC, 60, 0);
-
-  Serial.println("Central pronta.");
+  // sequência de boot: toca cada elemento da bateria em ordem
+  delay(200); // aguarda audioTask iniciar
+  const uint8_t bootZones[] = { ZONE_FX, ZONE_SNARE, ZONE_HHC, ZONE_HHO, ZONE_TOM1, ZONE_TOM2, ZONE_CRASH, ZONE_RIDE };
+  for (int i = 0; i < 8; i++) {
+    enqueueHit(bootZones[i], 100, 0);
+    delay(350);
+  }
 }
 
 void loop() {
-  // Aqui depois você pluga:
-  // - ws2812b
-  // - sequencer 32x8
-  // - encoders
-  // - MIDI OUT
-  delay(10);
+  pollProxSensors();
+  delay(4);
 }

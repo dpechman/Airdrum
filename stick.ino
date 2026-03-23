@@ -9,13 +9,13 @@ extern "C" {
 // CONFIG
 // =========================
 #define STICK_ID                1   // mude para 1 ou 2
-#define I2C_SDA_PIN             4   // GPIO4 = D2 em muitas placas
-#define I2C_SCL_PIN             5   // GPIO5 = D1 em muitas placas
+#define I2C_SDA_PIN             2   // GPIO2 = D4
+#define I2C_SCL_PIN             0   // GPIO0 = D3
 #define MPU6050_ADDR            0x68
 
 // MAC da CENTRAL ESP32
 // descubra no Serial da central e copie aqui
-uint8_t PEER_MAC[6] = {0x24, 0x6F, 0x28, 0xAA, 0xBB, 0xCC};
+uint8_t PEER_MAC[6] = {0xA8, 0x46, 0x74, 0x92, 0x9A, 0x48};
 
 // canal Wi-Fi fixo para ESP-NOW
 #define ESPNOW_CHANNEL          1
@@ -24,8 +24,8 @@ uint8_t PEER_MAC[6] = {0x24, 0x6F, 0x28, 0xAA, 0xBB, 0xCC};
 #define SAMPLE_PERIOD_MS        4     // ~250 Hz
 
 // limiares
-#define HIT_THRESHOLD_G         1.85f // aceleração dinâmica mínima
-#define MIN_HIT_GAP_MS          70
+#define HIT_THRESHOLD_G         2.2f  // aceleração dinâmica mínima
+#define MIN_HIT_GAP_MS          20    // gap mínimo — apenas evita duplo trigger no mesmo impacto
 #define VELOCITY_MIN            15
 #define VELOCITY_MAX            127
 
@@ -57,9 +57,6 @@ enum HitZone : uint8_t {
   ZONE_RIDE  = 6,
   ZONE_FX    = 7
 };
-
-volatile bool sendOk = false;
-volatile bool sendDone = false;
 
 // =========================
 // MPU6050
@@ -113,11 +110,6 @@ void initMPU6050() {
 // =========================
 // ESPNOW
 // =========================
-void onDataSent(uint8_t *mac_addr, uint8_t status) {
-  sendOk = (status == 0);
-  sendDone = true;
-}
-
 bool initEspNow() {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
@@ -128,7 +120,6 @@ bool initEspNow() {
   }
 
   esp_now_set_self_role(ESP_NOW_ROLE_CONTROLLER);
-  esp_now_register_send_cb(onDataSent);
 
   if (esp_now_add_peer(PEER_MAC, ESP_NOW_ROLE_SLAVE, ESPNOW_CHANNEL, NULL, 0) != 0) {
     return false;
@@ -146,17 +137,8 @@ bool sendHit(uint8_t zone, uint8_t velocity, uint16_t peakMilliG, uint16_t dtMs)
   pkt.peakMilliG = peakMilliG;
   pkt.dtMs = dtMs;
 
-  sendDone = false;
   int rc = esp_now_send(PEER_MAC, (uint8_t*)&pkt, sizeof(pkt));
-  if (rc != 0) {
-    return false;
-  }
-
-  uint32_t t0 = millis();
-  while (!sendDone && millis() - t0 < 20) {
-    delay(0);
-  }
-  return sendDone && sendOk;
+  return (rc == 0);
 }
 
 // =========================
@@ -207,19 +189,25 @@ void setup() {
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   Wire.setClock(400000);
 
+  // scanner I2C
+  uint8_t found = 0;
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      Serial.printf("I2C: 0x%02X\n", addr);
+      found++;
+    }
+  }
+  if (found == 0) Serial.println("I2C: nenhum!");
+
   initMPU6050();
 
   if (!initEspNow()) {
-    Serial.println("ERRO: falha no ESP-NOW");
-    while (true) {
-      delay(1000);
-    }
+    Serial.println("ESPNOW FAIL");
+    while (true) delay(1000);
   }
 
-  Serial.println();
-  Serial.println("=== AIR DRUM STICK ESP8266 ===");
-  Serial.printf("Stick ID: %d\n", STICK_ID);
-  Serial.printf("WiFi MAC : %s\n", WiFi.macAddress().c_str());
+  Serial.printf("STICK %d MAC:%s\n", STICK_ID, WiFi.macAddress().c_str());
 }
 
 void loop() {
@@ -264,7 +252,8 @@ void loop() {
     hitReady = true;
   }
 
-  if (!armed && dyn < 0.35f) {
+  // re-arma por nível de sinal OU por tempo desde o último hit (para batidas rápidas)
+  if (!armed && (dyn < 0.35f || (nowMs - lastHitMs) > MIN_HIT_GAP_MS)) {
     armed = true;
   }
 
@@ -280,8 +269,8 @@ void loop() {
     lastHitMs = nowMs;
 
     bool ok = sendHit(zone, velocity, peakMilliG, dt);
-
-    Serial.printf("hit z=%u vel=%u peak=%.2fg tx=%s\n",
-                  zone, velocity, peakDyn, ok ? "ok" : "fail");
+    // z=zone v=velocity p=peak(mG) dt=intervalo tx=ok/fail
+    Serial.printf("HIT z=%u v=%u p=%u dt=%u %s\n",
+                  zone, velocity, peakMilliG, dt, ok ? "OK" : "FAIL");
   }
 }
